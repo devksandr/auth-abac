@@ -1,11 +1,13 @@
+using auth_abac.Databases;
+using Casbin;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.EntityFrameworkCore;
 using System.Security.Claims;
 
 var builder = WebApplication.CreateBuilder(args);
-
-
-builder.Services.AddControllers();
+string? connectionString = builder.Configuration.GetConnectionString("SQLiteConnection");
+builder.Services.AddDbContext<DataContext>(options => options.UseSqlite(connectionString));
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
     .AddCookie(options =>
@@ -17,14 +19,6 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
 
 var app = builder.Build();
 app.UseHttpsRedirection();
-app.MapControllers();
-
-
-// DEL
-var usernames = new List<string>
-{
-    "Admin"
-};
 
 app.MapGet("/login", (string? message, HttpContext context) =>
 {
@@ -48,11 +42,11 @@ app.MapGet("/login", (string? message, HttpContext context) =>
     return Results.Content(formHTML, "text/html");
 });
 
-app.MapPost("/login", async (HttpContext context) => 
+app.MapPost("/login", async (HttpContext context, DataContext db) => 
 {
     var form = context.Request.Form;
     string username = form["username"]!;
-    if (!usernames.Contains(username))
+    if (!db.Users.Any(u => u.Name == username))
     {
         string message = $"No user with username = {username}";
         return Results.Redirect($"/login?message={message}");
@@ -74,24 +68,72 @@ app.MapGet("/logout", async (HttpContext context) =>
     return Results.Redirect("/login");
 });
 
-app.Map("/", (HttpContext context) =>
+app.Map("/", (HttpContext context, DataContext db) =>
 {
     string responseHTML = "";
     if (context.User.Identity?.IsAuthenticated == true)
     {
         var username = context.User.FindFirst(ClaimTypes.Name)!.Value;
+
+        var e = new Enforcer("Authorization/model.conf");
+
+        var sub = db.Users
+            .Where(u => u.Name == username)
+            .Include(u => u.Position)
+            .Include(u => u.Department)
+            .Select(u => new
+            {
+                Position = u.Position.Name,
+                Department = u.Department.Name,
+                EnrollmentDate = u.EnrollmentDate
+            })
+            .FirstOrDefault();
+
+        var accessProducts = db.Products
+            .Include(p => p.Department)
+            .Select(p => new
+            {
+                Name = p.Name,
+                Department = p.Department.Name,
+                Timestamp = p.Timestamp
+            })
+            .ToList()
+            .Where(p => e.Enforce(sub, p))
+            .ToList();
+
+        var productsList = accessProducts
+            .Select(p => $"<li>{p.Department} {p.Timestamp} {p.Name}</li>")
+            .Aggregate("", (f, n) => $"{f}{n}");
+
+        var productsHTML =
+            $"""
+            <p>You have access to these products:</p>
+            <ul>
+                {productsList}
+            </ul>
+            """;
+
         responseHTML =
-        $"""
-        <p>Hello {username}</p>
-        <br>
-        <a href="/logout">Log out<a/>
-        """;
+            $"""
+            <p>Hello {username}</p>
+            <br>
+            <p>Info:</p>
+            <ul>
+                <li>Position: {sub.Position}</li>
+                <li>Department: {sub.Department ?? "-"}</li>
+                <li>EnrollmentDate : {sub.EnrollmentDate}</li>
+            </ul>
+            <br>
+            {productsHTML}
+            <br>
+            <a href="/logout">Log out<a/>
+            """;
     }
     else
     {
         responseHTML =
         """
-        <p>Anonimous users don't have access to this page</p>
+        <p>Anonymous users don't have access to this page</p>
         <p>To get access try to <a href="/login">Log in<a/><p/>
         """;
     }
